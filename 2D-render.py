@@ -3,6 +3,7 @@ import taichi as ti
 ti.init(arch=ti.cpu)
 
 vec2=ti.types.vector(2,dtype=ti.f32)
+vec3=ti.types.vector(3,dtype=ti.f32)
 
 GRID_SIZE=32
 DOMAIN_MIN=0.1
@@ -16,11 +17,16 @@ FACE_X_NUM=(GRID_SIZE+1)*GRID_SIZE
 FACE_Y_NUM=GRID_SIZE*(GRID_SIZE+1)
 GRID_LINE_NUM=2*(GRID_SIZE+1)
 GRID_LINE_VERTEX_NUM=GRID_LINE_NUM*2
+PRESSURE_VERTEX_NUM=GRID_SIZE*GRID_SIZE*6
+COLORBAR_SEGMENTS=64
+COLORBAR_VERTEX_NUM=COLORBAR_SEGMENTS*6
+COLORBAR_LINE_VERTEX_NUM=10
 PRESSURE_ITERS=60
 SUBSTEPS=2
 PART_RADIUS=0.004
 RHO=1.0
 GRAVITY=-1.0
+ETA=0.0008
 BOUNCE=0.0
 EPS=1e-6
 WALL_MIN=DOMAIN_MIN+GRID_LEN
@@ -28,6 +34,14 @@ WALL_MAX=DOMAIN_MAX-GRID_LEN
 WALL_TANGENT_DAMP=0.35
 SURFACE_ALPHA=0.25
 MIN_SOLVE_NEIGHBORS=2
+PRESSURE_ALPHA=0.34
+COLORBAR_ALPHA=0.62
+BG_R=0.07
+BG_G=0.08
+BG_B=0.09
+COLORBAR_X0=0.925
+COLORBAR_X1=0.955
+COLORBAR_TICK_X=0.965
 
 TYPE_EMPTY=0
 TYPE_SOLID=1
@@ -35,6 +49,7 @@ TYPE_LIQUID=2
 
 dt=ti.field(dtype=ti.f32,shape=())
 alpha=ti.field(dtype=ti.f32,shape=())
+pressure_abs_max=ti.field(dtype=ti.f32,shape=())
 
 parts_pos=ti.Vector.field(2,dtype=ti.f32,shape=NUM_PARTICLES)
 old_parts_vel=ti.Vector.field(2,dtype=ti.f32,shape=NUM_PARTICLES)
@@ -49,6 +64,8 @@ grid_pres=ti.field(dtype=ti.f32,shape=GRID_SIZE*GRID_SIZE)
 
 grid_velx=ti.field(dtype=ti.f32,shape=FACE_X_NUM)
 grid_vely=ti.field(dtype=ti.f32,shape=FACE_Y_NUM)
+tmp_grid_velx=ti.field(dtype=ti.f32,shape=FACE_X_NUM)
+tmp_grid_vely=ti.field(dtype=ti.f32,shape=FACE_Y_NUM)
 old_grid_vel_x=ti.field(dtype=ti.f32,shape=FACE_X_NUM)
 old_grid_vel_y=ti.field(dtype=ti.f32,shape=FACE_Y_NUM)
 grid_weightx=ti.field(dtype=ti.f32,shape=FACE_X_NUM)
@@ -56,6 +73,11 @@ grid_weighty=ti.field(dtype=ti.f32,shape=FACE_Y_NUM)
 grid_validx=ti.field(dtype=ti.i32,shape=FACE_X_NUM)
 grid_validy=ti.field(dtype=ti.i32,shape=FACE_Y_NUM)
 grid_lines=ti.Vector.field(2,dtype=ti.f32,shape=GRID_LINE_VERTEX_NUM)
+pressure_verts=ti.Vector.field(2,dtype=ti.f32,shape=PRESSURE_VERTEX_NUM)
+pressure_colors=ti.Vector.field(3,dtype=ti.f32,shape=PRESSURE_VERTEX_NUM)
+colorbar_verts=ti.Vector.field(2,dtype=ti.f32,shape=COLORBAR_VERTEX_NUM)
+colorbar_colors=ti.Vector.field(3,dtype=ti.f32,shape=COLORBAR_VERTEX_NUM)
+colorbar_lines=ti.Vector.field(2,dtype=ti.f32,shape=COLORBAR_LINE_VERTEX_NUM)
 
 paused=False
 
@@ -88,6 +110,40 @@ def face_y_pos(i:int,j:int)->vec2:
     return ti.Vector([DOMAIN_MIN+(ti.cast(i,ti.f32)+0.5)*GRID_LEN,DOMAIN_MIN+ti.cast(j,ti.f32)*GRID_LEN])
 
 @ti.func
+def solid_face_x(fi:int,fj:int)->int:
+    ans=0
+    if fi<=0:
+        ans=1
+    elif fi>=GRID_SIZE:
+        ans=1
+    elif fj<0:
+        ans=1
+    elif fj>=GRID_SIZE:
+        ans=1
+    elif is_solid_cell(fi-1,fj)==1:
+        ans=1
+    elif is_solid_cell(fi,fj)==1:
+        ans=1
+    return ans
+
+@ti.func
+def solid_face_y(fi:int,fj:int)->int:
+    ans=0
+    if fi<0:
+        ans=1
+    elif fi>=GRID_SIZE:
+        ans=1
+    elif fj<=0:
+        ans=1
+    elif fj>=GRID_SIZE:
+        ans=1
+    elif is_solid_cell(fi,fj-1)==1:
+        ans=1
+    elif is_solid_cell(fi,fj)==1:
+        ans=1
+    return ans
+
+@ti.func
 def kern(r:ti.f32)->ti.f32:
     a=ti.abs(r)
     ans=0.0
@@ -101,6 +157,22 @@ def kern(r:ti.f32)->ti.f32:
 def weight(dr:vec2)->ti.f32:
     r=dr/GRID_LEN
     return kern(r[0])*kern(r[1])
+
+@ti.func
+def pressure_color(t:ti.f32,a:ti.f32)->vec3:
+    x=ti.min(ti.max(t,0.0),1.0)
+    mid=ti.Vector([0.94,0.95,0.96])
+    cold=ti.Vector([0.20,0.44,0.95])
+    hot=ti.Vector([1.00,0.38,0.18])
+    raw=mid
+    if x<0.5:
+        s=x*2.0
+        raw=cold*(1.0-s)+mid*s
+    else:
+        s=(x-0.5)*2.0
+        raw=mid*(1.0-s)+hot*s
+    bg=ti.Vector([BG_R,BG_G,BG_B])
+    return bg*(1.0-a)+raw*a
 
 @ti.func
 def is_solid_cell(i:int,j:int)->int:
@@ -173,6 +245,46 @@ def has_liquid_y(fi:int,fj:int)->int:
     return ans
 
 @ti.func
+def lap_x_value(fi:int,fj:int,center:ti.f32)->ti.f32:
+    ans=center
+    if fi>=0 and fi<=GRID_SIZE and fj>=0 and fj<GRID_SIZE:
+        fid=face_x_id(fi,fj)
+        if grid_validx[fid]==1:
+            ans=grid_velx[fid]
+        elif solid_face_x(fi,fj)==1:
+            ans=0.0
+    return ans
+
+@ti.func
+def lap_y_value(fi:int,fj:int,center:ti.f32)->ti.f32:
+    ans=center
+    if fi>=0 and fi<GRID_SIZE and fj>=0 and fj<=GRID_SIZE:
+        fid=face_y_id(fi,fj)
+        if grid_validy[fid]==1:
+            ans=grid_vely[fid]
+        elif solid_face_y(fi,fj)==1:
+            ans=0.0
+    return ans
+
+@ti.func
+def laplacian_x(fi:int,fj:int)->ti.f32:
+    center=grid_velx[face_x_id(fi,fj)]
+    left=lap_x_value(fi-1,fj,center)
+    right=lap_x_value(fi+1,fj,center)
+    down=lap_x_value(fi,fj-1,center)
+    up=lap_x_value(fi,fj+1,center)
+    return (left+right+down+up-4.0*center)/(GRID_LEN*GRID_LEN)
+
+@ti.func
+def laplacian_y(fi:int,fj:int)->ti.f32:
+    center=grid_vely[face_y_id(fi,fj)]
+    left=lap_y_value(fi-1,fj,center)
+    right=lap_y_value(fi+1,fj,center)
+    down=lap_y_value(fi,fj-1,center)
+    up=lap_y_value(fi,fj+1,center)
+    return (left+right+down+up-4.0*center)/(GRID_LEN*GRID_LEN)
+
+@ti.func
 def part_cell(pos:vec2)->int:
     ci=ti.cast(ti.floor((pos[0]-DOMAIN_MIN)/GRID_LEN),ti.i32)
     cj=ti.cast(ti.floor((pos[1]-DOMAIN_MIN)/GRID_LEN),ti.i32)
@@ -236,6 +348,47 @@ def init_grid_lines():
         grid_lines[base+1]=ti.Vector([DOMAIN_MAX,y])
 
 @ti.kernel
+def init_pressure_visual():
+    for i,j in ti.ndrange(GRID_SIZE,GRID_SIZE):
+        x0=DOMAIN_MIN+ti.cast(i,ti.f32)*GRID_LEN
+        x1=x0+GRID_LEN
+        y0=DOMAIN_MIN+ti.cast(j,ti.f32)*GRID_LEN
+        y1=y0+GRID_LEN
+        base=cell_id(i,j)*6
+        pressure_verts[base]=ti.Vector([x0,y0])
+        pressure_verts[base+1]=ti.Vector([x1,y0])
+        pressure_verts[base+2]=ti.Vector([x1,y1])
+        pressure_verts[base+3]=ti.Vector([x0,y0])
+        pressure_verts[base+4]=ti.Vector([x1,y1])
+        pressure_verts[base+5]=ti.Vector([x0,y1])
+        c=ti.Vector([BG_R,BG_G,BG_B])
+        for k in ti.static(range(6)):
+            pressure_colors[base+k]=c
+    for s in range(COLORBAR_SEGMENTS):
+        y0=DOMAIN_MIN+DOMAIN_LEN*ti.cast(s,ti.f32)/ti.cast(COLORBAR_SEGMENTS,ti.f32)
+        y1=DOMAIN_MIN+DOMAIN_LEN*ti.cast(s+1,ti.f32)/ti.cast(COLORBAR_SEGMENTS,ti.f32)
+        base=s*6
+        colorbar_verts[base]=ti.Vector([COLORBAR_X0,y0])
+        colorbar_verts[base+1]=ti.Vector([COLORBAR_X1,y0])
+        colorbar_verts[base+2]=ti.Vector([COLORBAR_X1,y1])
+        colorbar_verts[base+3]=ti.Vector([COLORBAR_X0,y0])
+        colorbar_verts[base+4]=ti.Vector([COLORBAR_X1,y1])
+        colorbar_verts[base+5]=ti.Vector([COLORBAR_X0,y1])
+        c=pressure_color((ti.cast(s,ti.f32)+0.5)/ti.cast(COLORBAR_SEGMENTS,ti.f32),COLORBAR_ALPHA)
+        for k in ti.static(range(6)):
+            colorbar_colors[base+k]=c
+    colorbar_lines[0]=ti.Vector([COLORBAR_X0,DOMAIN_MIN])
+    colorbar_lines[1]=ti.Vector([COLORBAR_X1,DOMAIN_MIN])
+    colorbar_lines[2]=ti.Vector([COLORBAR_X1,DOMAIN_MIN])
+    colorbar_lines[3]=ti.Vector([COLORBAR_X1,DOMAIN_MAX])
+    colorbar_lines[4]=ti.Vector([COLORBAR_X1,DOMAIN_MAX])
+    colorbar_lines[5]=ti.Vector([COLORBAR_X0,DOMAIN_MAX])
+    colorbar_lines[6]=ti.Vector([COLORBAR_X0,DOMAIN_MAX])
+    colorbar_lines[7]=ti.Vector([COLORBAR_X0,DOMAIN_MIN])
+    colorbar_lines[8]=ti.Vector([COLORBAR_X1,0.5*(DOMAIN_MIN+DOMAIN_MAX)])
+    colorbar_lines[9]=ti.Vector([COLORBAR_TICK_X,0.5*(DOMAIN_MIN+DOMAIN_MAX)])
+
+@ti.kernel
 def init_particles():
     for i in range(NUM_PARTICLES):
         col=i%PARTICLE_COLS
@@ -251,11 +404,13 @@ def init_particles():
         parts_grid[i]=part_cell(parts_pos[i])
     for i in range(FACE_X_NUM):
         grid_velx[i]=0.0
+        tmp_grid_velx[i]=0.0
         old_grid_vel_x[i]=0.0
         grid_weightx[i]=0.0
         grid_validx[i]=0
     for i in range(FACE_Y_NUM):
         grid_vely[i]=0.0
+        tmp_grid_vely[i]=0.0
         old_grid_vel_y[i]=0.0
         grid_weighty[i]=0.0
         grid_validy[i]=0
@@ -279,10 +434,12 @@ def P2G():
             grid_type[i]=TYPE_EMPTY
     for i in range(FACE_X_NUM):
         grid_velx[i]=0.0
+        tmp_grid_velx[i]=0.0
         grid_weightx[i]=0.0
         grid_validx[i]=0
     for i in range(FACE_Y_NUM):
         grid_vely[i]=0.0
+        tmp_grid_vely[i]=0.0
         grid_weighty[i]=0.0
         grid_validy[i]=0
     for p in range(NUM_PARTICLES):
@@ -348,13 +505,23 @@ def P2G():
 
 @ti.kernel
 def add_force():
+    nu=ETA/RHO
+    for i in range(FACE_X_NUM):
+        fi=i//GRID_SIZE
+        fj=i%GRID_SIZE
+        tmp_grid_velx[i]=grid_velx[i]
+        if grid_validx[i]==1:
+            tmp_grid_velx[i]=grid_velx[i]+dt[None]*nu*laplacian_x(fi,fj)
     for i in range(FACE_Y_NUM):
         fi=i//(GRID_SIZE+1)
         fj=i%(GRID_SIZE+1)
-        if fj>0 and fj<GRID_SIZE:
-            if is_solid_cell(fi,fj-1)==0 and is_solid_cell(fi,fj)==0:
-                if is_liquid_cell(fi,fj-1)==1 or is_liquid_cell(fi,fj)==1:
-                    grid_vely[i]+=GRAVITY*dt[None]
+        tmp_grid_vely[i]=grid_vely[i]
+        if grid_validy[i]==1:
+            tmp_grid_vely[i]=grid_vely[i]+dt[None]*(GRAVITY+nu*laplacian_y(fi,fj))
+    for i in range(FACE_X_NUM):
+        grid_velx[i]=tmp_grid_velx[i]
+    for i in range(FACE_Y_NUM):
+        grid_vely[i]=tmp_grid_vely[i]
 
 @ti.kernel
 def solve_pressure():
@@ -410,6 +577,21 @@ def project_velocity():
             grid_vely[i]=grid_vely[i]
         else:
             grid_vely[i]=0.0
+
+@ti.kernel
+def update_pressure_visual():
+    pressure_abs_max[None]=EPS
+    for i in range(GRID_SIZE*GRID_SIZE):
+        if grid_solve[i]==1:
+            ti.atomic_max(pressure_abs_max[None],ti.abs(grid_pres[i]))
+    for i in range(GRID_SIZE*GRID_SIZE):
+        c=ti.Vector([BG_R,BG_G,BG_B])
+        if grid_solve[i]==1:
+            t=0.5+0.5*grid_pres[i]/pressure_abs_max[None]
+            c=pressure_color(t,PRESSURE_ALPHA)
+        base=i*6
+        for k in ti.static(range(6)):
+            pressure_colors[base+k]=c
 
 @ti.kernel
 def G2P():
@@ -473,6 +655,7 @@ def init():
     dt[None]=0.005
     alpha[None]=0.95
     init_grid_lines()
+    init_pressure_visual()
     init_particles()
 
 def clamp(v,lo,hi):
@@ -491,15 +674,24 @@ def handle_input(window):
         alpha[None]=clamp(alpha[None]-0.01,0.0,1.0)
     if window.is_pressed(ti.ui.RIGHT):
         alpha[None]=clamp(alpha[None]+0.01,0.0,1.0)
-    if window.is_pressed(ti.ui.DOWN):
-        dt[None]=clamp(dt[None]*0.98,0.001,0.02)
-    if window.is_pressed(ti.ui.UP):
-        dt[None]=clamp(dt[None]*1.02,0.001,0.02)
 
 def render(canvas:ti.ui.Canvas):
+    update_pressure_visual()
     canvas.set_background_color((0.07,0.08,0.09))
+    canvas.triangles(pressure_verts,per_vertex_color=pressure_colors)
+    canvas.triangles(colorbar_verts,per_vertex_color=colorbar_colors)
     canvas.lines(grid_lines,width=0.001,color=(0.24,0.27,0.30))
+    canvas.lines(colorbar_lines,width=0.001,color=(0.42,0.45,0.48))
     canvas.circles(parts_pos,PART_RADIUS,color=(0.22,0.55,0.95))
+
+def render_gui(window):
+    gui=window.get_gui()
+    gui.begin("Control",0.02,0.02,0.26,0.16)
+    gui.text(f"flipRatio: {alpha[None]:.2f}")
+    alpha[None]=clamp(gui.slider_float("flipRatio",alpha[None],0.0,1.0),0.0,1.0)
+    gui.text(f"eta: {ETA:.4f}")
+    gui.text(f"dt fixed: {dt[None]:.4f}")
+    gui.end()
 
 def main():
     init()
@@ -511,6 +703,7 @@ def main():
             for _ in range(SUBSTEPS):
                 substep()
         render(canvas)
+        render_gui(window)
         window.show()
 
 if __name__=="__main__":
