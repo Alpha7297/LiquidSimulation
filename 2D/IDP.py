@@ -10,9 +10,13 @@ DOMAIN_MIN=0.1
 DOMAIN_MAX=0.9
 DOMAIN_LEN=DOMAIN_MAX-DOMAIN_MIN
 GRID_LEN=DOMAIN_LEN/float(GRID_SIZE)
-PARTICLE_COLS=30
-PARTICLE_ROWS=30
-NUM_PARTICLES=PARTICLE_COLS*PARTICLE_ROWS
+LIQUID_CELL_COLS=16
+LIQUID_CELL_ROWS=13
+LIQUID_START_I=4
+LIQUID_START_J=2
+PARTICLES_PER_CELL_AXIS=2
+PARTICLES_PER_CELL=PARTICLES_PER_CELL_AXIS*PARTICLES_PER_CELL_AXIS
+NUM_PARTICLES=LIQUID_CELL_COLS*LIQUID_CELL_ROWS*PARTICLES_PER_CELL
 FACE_X_NUM=(GRID_SIZE+1)*GRID_SIZE
 FACE_Y_NUM=GRID_SIZE*(GRID_SIZE+1)
 GRID_LINE_NUM=2*(GRID_SIZE+1)
@@ -34,6 +38,10 @@ WALL_MAX=DOMAIN_MAX-GRID_LEN
 WALL_TANGENT_DAMP=0.35
 SURFACE_ALPHA=0.25
 MIN_SOLVE_NEIGHBORS=2
+IDP_BETA=0.5
+IDP_MAX_ERROR=0.30
+DENSITY_REST_THRESHOLD=1.0
+DENSITY_LIQUID_RATIO=0.22
 PRESSURE_ALPHA=0.34
 COLORBAR_ALPHA=0.62
 BG_R=0.07
@@ -50,6 +58,9 @@ TYPE_LIQUID=2
 dt=ti.field(dtype=ti.f32,shape=())
 alpha=ti.field(dtype=ti.f32,shape=())
 pressure_abs_max=ti.field(dtype=ti.f32,shape=())
+rest_density=ti.field(dtype=ti.f32,shape=())
+density_sum=ti.field(dtype=ti.f32,shape=())
+density_cnt=ti.field(dtype=ti.f32,shape=())
 
 parts_pos=ti.Vector.field(2,dtype=ti.f32,shape=NUM_PARTICLES)
 old_parts_vel=ti.Vector.field(2,dtype=ti.f32,shape=NUM_PARTICLES)
@@ -61,6 +72,7 @@ grid_type=ti.field(dtype=ti.i32,shape=GRID_SIZE*GRID_SIZE)
 grid_cnt=ti.field(dtype=ti.i32,shape=GRID_SIZE*GRID_SIZE)
 grid_solve=ti.field(dtype=ti.i32,shape=GRID_SIZE*GRID_SIZE)
 grid_pres=ti.field(dtype=ti.f32,shape=GRID_SIZE*GRID_SIZE)
+grid_density=ti.field(dtype=ti.f32,shape=GRID_SIZE*GRID_SIZE)
 
 grid_velx=ti.field(dtype=ti.f32,shape=FACE_X_NUM)
 grid_vely=ti.field(dtype=ti.f32,shape=FACE_Y_NUM)
@@ -220,6 +232,16 @@ def pressure_at(i:int,j:int)->ti.f32:
     if i>=0 and i<GRID_SIZE and j>=0 and j<GRID_SIZE:
         if grid_solve[cell_id(i,j)]==1:
             ans=grid_pres[cell_id(i,j)]
+    return ans
+
+@ti.func
+def target_divergence(gid:int)->ti.f32:
+    ans=0.0
+    if rest_density[None]>EPS:
+        err=(grid_density[gid]-rest_density[None])/rest_density[None]
+        if err>0.0:
+            err=ti.min(err,IDP_MAX_ERROR)
+            ans=IDP_BETA*err/dt[None]
     return ans
 
 @ti.func
@@ -391,12 +413,18 @@ def init_pressure_visual():
 @ti.kernel
 def init_particles():
     for i in range(NUM_PARTICLES):
-        col=i%PARTICLE_COLS
-        row=i//PARTICLE_COLS
-        jitter_x=ti.cast((i*17+13)%29,ti.f32)/29.0
-        jitter_y=ti.cast((i*31+7)%37,ti.f32)/37.0
-        x=0.22+(ti.cast(col,ti.f32)+0.2+0.45*jitter_x)*GRID_LEN/1.7
-        y=0.18+(ti.cast(row,ti.f32)+0.2+0.45*jitter_y)*GRID_LEN/1.7
+        cell=i//PARTICLES_PER_CELL
+        local=i%PARTICLES_PER_CELL
+        cell_i=cell%LIQUID_CELL_COLS
+        cell_j=cell//LIQUID_CELL_COLS
+        local_i=local%PARTICLES_PER_CELL_AXIS
+        local_j=local//PARTICLES_PER_CELL_AXIS
+        jitter_x=0.06*(ti.cast((i*17+13)%29,ti.f32)/29.0-0.5)
+        jitter_y=0.06*(ti.cast((i*31+7)%37,ti.f32)/37.0-0.5)
+        offset_x=(ti.cast(local_i,ti.f32)+0.5+jitter_x)/ti.cast(PARTICLES_PER_CELL_AXIS,ti.f32)
+        offset_y=(ti.cast(local_j,ti.f32)+0.5+jitter_y)/ti.cast(PARTICLES_PER_CELL_AXIS,ti.f32)
+        x=DOMAIN_MIN+(ti.cast(LIQUID_START_I+cell_i,ti.f32)+offset_x)*GRID_LEN
+        y=DOMAIN_MIN+(ti.cast(LIQUID_START_J+cell_j,ti.f32)+offset_y)*GRID_LEN
         parts_pos[i]=ti.Vector([x,y])
         parts_vel[i]=ti.Vector([0.0,0.0])
         old_parts_vel[i]=ti.Vector([0.0,0.0])
@@ -419,6 +447,35 @@ def init_particles():
         grid_cnt[i]=0
         grid_solve[i]=0
         grid_pres[i]=0.0
+        grid_density[i]=0.0
+
+@ti.kernel
+def compute_density():
+    for i in range(GRID_SIZE*GRID_SIZE):
+        grid_density[i]=0.0
+    for p in range(NUM_PARTICLES):
+        pos=parts_pos[p]
+        base_i=ti.cast(ti.floor((pos[0]-DOMAIN_MIN)/GRID_LEN-0.5),ti.i32)
+        base_j=ti.cast(ti.floor((pos[1]-DOMAIN_MIN)/GRID_LEN-0.5),ti.i32)
+        for di in ti.static(range(-1,3)):
+            for dj in ti.static(range(-1,3)):
+                ci=base_i+di
+                cj=base_j+dj
+                if ci>=0 and ci<GRID_SIZE and cj>=0 and cj<GRID_SIZE:
+                    w=weight(cell_pos(ci,cj)-pos)
+                    ti.atomic_add(grid_density[cell_id(ci,cj)],w)
+
+@ti.kernel
+def init_rest_density():
+    density_sum[None]=0.0
+    density_cnt[None]=0.0
+    for i in range(GRID_SIZE*GRID_SIZE):
+        if grid_density[i]>DENSITY_REST_THRESHOLD:
+            ti.atomic_add(density_sum[None],grid_density[i])
+            ti.atomic_add(density_cnt[None],1.0)
+    rest_density[None]=1.0
+    if density_cnt[None]>0.0:
+        rest_density[None]=density_sum[None]/density_cnt[None]
 
 @ti.kernel
 def P2G():
@@ -428,6 +485,7 @@ def P2G():
         grid_cnt[i]=0
         grid_solve[i]=0
         grid_pres[i]=0.0
+        grid_density[i]=0.0
         if gi==0 or gi==GRID_SIZE-1 or gj==0 or gj==GRID_SIZE-1:
             grid_type[i]=TYPE_SOLID
         else:
@@ -449,6 +507,22 @@ def P2G():
         if grid_type[gid]!=TYPE_SOLID:
             grid_type[gid]=TYPE_LIQUID
             ti.atomic_add(grid_cnt[gid],1)
+    for p in range(NUM_PARTICLES):
+        pos=parts_pos[p]
+        base_i=ti.cast(ti.floor((pos[0]-DOMAIN_MIN)/GRID_LEN-0.5),ti.i32)
+        base_j=ti.cast(ti.floor((pos[1]-DOMAIN_MIN)/GRID_LEN-0.5),ti.i32)
+        for di in ti.static(range(-1,3)):
+            for dj in ti.static(range(-1,3)):
+                ci=base_i+di
+                cj=base_j+dj
+                if ci>=0 and ci<GRID_SIZE and cj>=0 and cj<GRID_SIZE:
+                    w=weight(cell_pos(ci,cj)-pos)
+                    ti.atomic_add(grid_density[cell_id(ci,cj)],w)
+    for i,j in ti.ndrange(GRID_SIZE,GRID_SIZE):
+        gid=cell_id(i,j)
+        if grid_type[gid]!=TYPE_SOLID:
+            if grid_density[gid]>DENSITY_LIQUID_RATIO*rest_density[None]:
+                grid_type[gid]=TYPE_LIQUID
     for i,j in ti.ndrange(GRID_SIZE,GRID_SIZE):
         gid=cell_id(i,j)
         if grid_type[gid]==TYPE_LIQUID:
@@ -531,6 +605,7 @@ def solve_pressure():
             gid=cell_id(i,j)
             if grid_solve[gid]==1:
                 div=(grid_velx[face_x_id(i+1,j)]-grid_velx[face_x_id(i,j)]+grid_vely[face_y_id(i,j+1)]-grid_vely[face_y_id(i,j)])/GRID_LEN
+                target_div=target_divergence(gid)
                 cnt=0.0
                 psum=0.0
                 if is_solid_cell(i-1,j)==0:
@@ -546,7 +621,7 @@ def solve_pressure():
                     cnt+=1.0
                     psum+=pressure_at(i,j+1)
                 if cnt>0.0:
-                    grid_pres[gid]=(psum-coef*div)/cnt
+                    grid_pres[gid]=(psum-coef*(div-target_div))/cnt
 
 @ti.kernel
 def project_velocity():
@@ -654,9 +729,12 @@ def substep():
 def init():
     dt[None]=0.005
     alpha[None]=0.95
+    rest_density[None]=1.0
     init_grid_lines()
     init_pressure_visual()
     init_particles()
+    compute_density()
+    init_rest_density()
 
 def clamp(v,lo,hi):
     return max(lo,min(v,hi))
@@ -690,6 +768,9 @@ def render_gui(window):
     gui.text(f"flipRatio: {alpha[None]:.2f}")
     alpha[None]=clamp(gui.slider_float("flipRatio",alpha[None],0.0,1.0),0.0,1.0)
     gui.text(f"eta: {ETA:.4f}")
+    gui.text(f"IDP beta: {IDP_BETA:.2f}")
+    gui.text(f"rest density: {rest_density[None]:.2f}")
+    gui.text(f"particles/cell: {PARTICLES_PER_CELL}")
     gui.text(f"dt fixed: {dt[None]:.4f}")
     gui.end()
 
