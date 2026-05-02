@@ -25,7 +25,7 @@ PRESSURE_VERTEX_NUM=GRID_SIZE*GRID_SIZE*6
 COLORBAR_SEGMENTS=64
 COLORBAR_VERTEX_NUM=COLORBAR_SEGMENTS*6
 COLORBAR_LINE_VERTEX_NUM=10
-PRESSURE_ITERS=60
+PRESSURE_ITERS=120
 SUBSTEPS=2
 PART_RADIUS=0.004
 RHO=1.0
@@ -35,13 +35,15 @@ BOUNCE=0.0
 EPS=1e-6
 WALL_MIN=DOMAIN_MIN+GRID_LEN
 WALL_MAX=DOMAIN_MAX-GRID_LEN
-WALL_TANGENT_DAMP=0.35
-SURFACE_ALPHA=0.25
-MIN_SOLVE_NEIGHBORS=2
+WALL_TANGENT_DAMP=0.95
+SURFACE_ALPHA=0.95
+EXTRAPOLATE_ITERS=1
+MIN_SOLVE_NEIGHBORS=1
 IDP_BETA=0.5
 IDP_MAX_ERROR=0.30
 DENSITY_REST_THRESHOLD=1.0
-DENSITY_LIQUID_RATIO=0.22
+DENSITY_LIQUID_RATIO=0.12
+MAX_PARTICLE_SPEED=6.0
 PRESSURE_ALPHA=0.34
 COLORBAR_ALPHA=0.62
 BG_R=0.07
@@ -84,6 +86,8 @@ grid_weightx=ti.field(dtype=ti.f32,shape=FACE_X_NUM)
 grid_weighty=ti.field(dtype=ti.f32,shape=FACE_Y_NUM)
 grid_validx=ti.field(dtype=ti.i32,shape=FACE_X_NUM)
 grid_validy=ti.field(dtype=ti.i32,shape=FACE_Y_NUM)
+tmp_validx=ti.field(dtype=ti.i32,shape=FACE_X_NUM)
+tmp_validy=ti.field(dtype=ti.i32,shape=FACE_Y_NUM)
 grid_lines=ti.Vector.field(2,dtype=ti.f32,shape=GRID_LINE_VERTEX_NUM)
 pressure_verts=ti.Vector.field(2,dtype=ti.f32,shape=PRESSURE_VERTEX_NUM)
 pressure_colors=ti.Vector.field(3,dtype=ti.f32,shape=PRESSURE_VERTEX_NUM)
@@ -561,8 +565,6 @@ def P2G():
             grid_velx[i]/=grid_weightx[i]
         if fi==0 or fi==GRID_SIZE:
             grid_velx[i]=0.0
-        elif is_solid_cell(fi-1,fj)==1 or is_solid_cell(fi,fj)==1:
-            grid_velx[i]=0.0
         old_grid_vel_x[i]=grid_velx[i]
     for i in range(FACE_Y_NUM):
         fi=i//(GRID_SIZE+1)
@@ -572,8 +574,6 @@ def P2G():
         if grid_weighty[i]>EPS:
             grid_vely[i]/=grid_weighty[i]
         if fj==0 or fj==GRID_SIZE:
-            grid_vely[i]=0.0
-        elif is_solid_cell(fi,fj-1)==1 or is_solid_cell(fi,fj)==1:
             grid_vely[i]=0.0
         old_grid_vel_y[i]=grid_vely[i]
 
@@ -600,6 +600,7 @@ def add_force():
 @ti.kernel
 def solve_pressure():
     coef=RHO*GRID_LEN*GRID_LEN/dt[None]
+    wall_coef=RHO*GRID_LEN/dt[None]
     for _ in range(PRESSURE_ITERS):
         for i,j in ti.ndrange(GRID_SIZE,GRID_SIZE):
             gid=cell_id(i,j)
@@ -608,20 +609,29 @@ def solve_pressure():
                 target_div=target_divergence(gid)
                 cnt=0.0
                 psum=0.0
+                solid_term=0.0
                 if is_solid_cell(i-1,j)==0:
                     cnt+=1.0
                     psum+=pressure_at(i-1,j)
+                else:
+                    solid_term+=-wall_coef*grid_velx[face_x_id(i,j)]
                 if is_solid_cell(i+1,j)==0:
                     cnt+=1.0
                     psum+=pressure_at(i+1,j)
+                else:
+                    solid_term+=wall_coef*grid_velx[face_x_id(i+1,j)]
                 if is_solid_cell(i,j-1)==0:
                     cnt+=1.0
                     psum+=pressure_at(i,j-1)
+                else:
+                    solid_term+=-wall_coef*grid_vely[face_y_id(i,j)]
                 if is_solid_cell(i,j+1)==0:
                     cnt+=1.0
                     psum+=pressure_at(i,j+1)
+                else:
+                    solid_term+=wall_coef*grid_vely[face_y_id(i,j+1)]
                 if cnt>0.0:
-                    grid_pres[gid]=(psum-coef*(div-target_div))/cnt
+                    grid_pres[gid]=(psum+solid_term-coef*(div-target_div))/cnt
 
 @ti.kernel
 def project_velocity():
@@ -652,6 +662,82 @@ def project_velocity():
             grid_vely[i]=grid_vely[i]
         else:
             grid_vely[i]=0.0
+
+@ti.kernel
+def extrapolate_velocity():
+    for _ in ti.static(range(EXTRAPOLATE_ITERS)):
+        for i in range(FACE_X_NUM):
+            fi=i//GRID_SIZE
+            fj=i%GRID_SIZE
+            tmp_grid_velx[i]=grid_velx[i]
+            tmp_validx[i]=grid_validx[i]
+            if grid_validx[i]==0 and fi>0 and fi<GRID_SIZE and solid_face_x(fi,fj)==0:
+                total=0.0
+                cnt=0.0
+                if fi>0:
+                    nid=face_x_id(fi-1,fj)
+                    if grid_validx[nid]==1:
+                        total+=grid_velx[nid]
+                        cnt+=1.0
+                if fi<GRID_SIZE:
+                    nid=face_x_id(fi+1,fj)
+                    if grid_validx[nid]==1:
+                        total+=grid_velx[nid]
+                        cnt+=1.0
+                if fj>0:
+                    nid=face_x_id(fi,fj-1)
+                    if grid_validx[nid]==1:
+                        total+=grid_velx[nid]
+                        cnt+=1.0
+                if fj<GRID_SIZE-1:
+                    nid=face_x_id(fi,fj+1)
+                    if grid_validx[nid]==1:
+                        total+=grid_velx[nid]
+                        cnt+=1.0
+                if cnt>0.0:
+                    tmp_grid_velx[i]=total/cnt
+                    tmp_validx[i]=1
+        for i in range(FACE_X_NUM):
+            if grid_validx[i]==0 and tmp_validx[i]==1:
+                old_grid_vel_x[i]=tmp_grid_velx[i]
+            grid_velx[i]=tmp_grid_velx[i]
+            grid_validx[i]=tmp_validx[i]
+        for i in range(FACE_Y_NUM):
+            fi=i//(GRID_SIZE+1)
+            fj=i%(GRID_SIZE+1)
+            tmp_grid_vely[i]=grid_vely[i]
+            tmp_validy[i]=grid_validy[i]
+            if grid_validy[i]==0 and fj>0 and fj<GRID_SIZE and solid_face_y(fi,fj)==0:
+                total=0.0
+                cnt=0.0
+                if fi>0:
+                    nid=face_y_id(fi-1,fj)
+                    if grid_validy[nid]==1:
+                        total+=grid_vely[nid]
+                        cnt+=1.0
+                if fi<GRID_SIZE-1:
+                    nid=face_y_id(fi+1,fj)
+                    if grid_validy[nid]==1:
+                        total+=grid_vely[nid]
+                        cnt+=1.0
+                if fj>0:
+                    nid=face_y_id(fi,fj-1)
+                    if grid_validy[nid]==1:
+                        total+=grid_vely[nid]
+                        cnt+=1.0
+                if fj<GRID_SIZE:
+                    nid=face_y_id(fi,fj+1)
+                    if grid_validy[nid]==1:
+                        total+=grid_vely[nid]
+                        cnt+=1.0
+                if cnt>0.0:
+                    tmp_grid_vely[i]=total/cnt
+                    tmp_validy[i]=1
+        for i in range(FACE_Y_NUM):
+            if grid_validy[i]==0 and tmp_validy[i]==1:
+                old_grid_vel_y[i]=tmp_grid_vely[i]
+            grid_vely[i]=tmp_grid_vely[i]
+            grid_validy[i]=tmp_validy[i]
 
 @ti.kernel
 def update_pressure_visual():
@@ -692,8 +778,8 @@ def update_pos():
     for i in range(NUM_PARTICLES):
         vel=new_part_vel[i]
         speed=vel.norm()
-        if speed>3.0:
-            vel=vel/speed*3.0
+        if speed>MAX_PARTICLE_SPEED:
+            vel=vel/speed*MAX_PARTICLE_SPEED
         pos=parts_pos[i]+vel*dt[None]
         if pos[0]<lo:
             pos[0]=lo
@@ -723,6 +809,7 @@ def substep():
     add_force()
     solve_pressure()
     project_velocity()
+    extrapolate_velocity()
     G2P()
     update_pos()
 
