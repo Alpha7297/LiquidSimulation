@@ -10,7 +10,9 @@ G=-2
 ETA=0.08
 MASS=0.0102
 H=0.072
-DT=0.001
+DT_INIT=0.001
+DT_MIN=0.0002
+DT_MAX=0.004
 GAMMA=4.0
 STIFFNESS=35.0
 DX=0.05
@@ -60,6 +62,7 @@ neighbour_count=ti.field(dtype=ti.i32,shape=PARTICLE_N)
 rest_density=ti.field(dtype=ti.f32,shape=())
 avg_neighbour_count=ti.field(dtype=ti.f32,shape=())
 max_pressure=ti.field(dtype=ti.f32,shape=())
+dt=ti.field(dtype=ti.f32,shape=())
 
 fluid_pos=ti.Vector.field(2,dtype=ti.f32,shape=FLUID_N)
 fluid_color=ti.Vector.field(3,dtype=ti.f32,shape=FLUID_N)
@@ -249,8 +252,8 @@ def compute_acceleration():
 def integrate():
     for i in range(PARTICLE_N):
         if edge[i]==0:
-            vel[i]+=DT*acc[i]
-            pos[i]+=DT*vel[i]
+            vel[i]+=dt[None]*acc[i]
+            pos[i]+=dt[None]*vel[i]
             if pos[i][0]<X_LEFT:
                 pos[i][0]=X_LEFT
                 if vel[i][0]<0.0:
@@ -286,6 +289,7 @@ def substep():
     integrate()
 
 def init():
+    dt[None]=DT_INIT
     init_container_lines()
     init_particles()
     find_neighbours()
@@ -303,6 +307,13 @@ def handle_input(window):
             paused=not paused
         elif e.key=="r" or e.key=="R":
             init()
+        elif e.key=="[":
+            dt[None]=clamp(dt[None]*0.8,DT_MIN,DT_MAX)
+        elif e.key=="]":
+            dt[None]=clamp(dt[None]*1.25,DT_MIN,DT_MAX)
+
+def clamp(v,lo,hi):
+    return max(lo,min(v,hi))
 
 def render(canvas:ti.ui.Canvas):
     update_render_fields()
@@ -319,6 +330,7 @@ def render_gui(window):
     gui.text(f"rest rho: {rest_density[None]:.3f}")
     gui.text(f"avg nb: {avg_neighbour_count[None]:.1f}")
     gui.text(f"stiffness: {STIFFNESS:.1f}")
+    dt[None]=clamp(gui.slider_float("dt",dt[None],DT_MIN,DT_MAX),DT_MIN,DT_MAX)
     gui.end()
 
 def main():

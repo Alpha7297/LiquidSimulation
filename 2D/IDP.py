@@ -27,6 +27,9 @@ COLORBAR_VERTEX_NUM=COLORBAR_SEGMENTS*6
 COLORBAR_LINE_VERTEX_NUM=10
 PRESSURE_ITERS=120
 SUBSTEPS=2
+DT_INIT=0.005
+DT_MIN=0.001
+DT_MAX=0.012
 PART_RADIUS=0.004
 RHO=1.0
 GRAVITY=-1.0
@@ -814,7 +817,7 @@ def substep():
     update_pos()
 
 def init():
-    dt[None]=0.005
+    dt[None]=DT_INIT
     alpha[None]=0.95
     rest_density[None]=1.0
     init_grid_lines()
@@ -835,6 +838,10 @@ def handle_input(window):
             paused=not paused
         elif e.key=="r" or e.key=="R":
             init()
+        elif e.key=="[":
+            dt[None]=clamp(dt[None]*0.8,DT_MIN,DT_MAX)
+        elif e.key=="]":
+            dt[None]=clamp(dt[None]*1.25,DT_MIN,DT_MAX)
     if window.is_pressed(ti.ui.LEFT):
         alpha[None]=clamp(alpha[None]-0.01,0.0,1.0)
     if window.is_pressed(ti.ui.RIGHT):
@@ -858,7 +865,7 @@ def render_gui(window):
     gui.text(f"IDP beta: {IDP_BETA:.2f}")
     gui.text(f"rest density: {rest_density[None]:.2f}")
     gui.text(f"particles/cell: {PARTICLES_PER_CELL}")
-    gui.text(f"dt fixed: {dt[None]:.4f}")
+    dt[None]=clamp(gui.slider_float("dt",dt[None],DT_MIN,DT_MAX),DT_MIN,DT_MAX)
     gui.end()
 
 def main():

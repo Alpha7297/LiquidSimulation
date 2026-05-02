@@ -11,6 +11,8 @@ ETA=0.08
 MASS=0.0102
 H=0.072
 DT_INIT=0.003
+DT_MIN=0.00025
+DT_MAX=0.006
 DX=0.05
 MAX_NEIGHBOUR=128
 PRESSURE_ITERS=120
@@ -461,6 +463,9 @@ def init():
     build_pressure_system()
     update_render_fields()
 
+def clamp(v,lo,hi):
+    return max(lo,min(v,hi))
+
 def handle_input(window):
     global paused
     for e in window.get_events(ti.ui.PRESS):
@@ -471,9 +476,9 @@ def handle_input(window):
         elif e.key=="r" or e.key=="R":
             init()
         elif e.key=="[":
-            dt[None]=max(0.00025,dt[None]*0.8)
+            dt[None]=clamp(dt[None]*0.8,DT_MIN,DT_MAX)
         elif e.key=="]":
-            dt[None]=min(0.006,dt[None]*1.25)
+            dt[None]=clamp(dt[None]*1.25,DT_MIN,DT_MAX)
 
 def render(canvas:ti.ui.Canvas):
     update_pressure_scale()
@@ -490,7 +495,7 @@ def render_gui(window):
     gui.text(f"fluid: {FLUID_N}")
     gui.text(f"rest rho: {rest_density[None]:.3f}")
     gui.text(f"avg nb: {avg_neighbour_count[None]:.1f}")
-    gui.text(f"dt: {dt[None]:.4f}")
+    dt[None]=clamp(gui.slider_float("dt",dt[None],DT_MIN,DT_MAX),DT_MIN,DT_MAX)
     gui.text(f"pressure iters: {PRESSURE_ITERS}")
     gui.text(f"color scale: {pressure_scale[None]:.2f}")
     gui.text(f"max div: {max_divergence[None]:.4f}")
